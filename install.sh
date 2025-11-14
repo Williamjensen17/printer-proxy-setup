@@ -1,37 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### === CONFIG === ###
-: "${PRINTER_IP?Error: You must set PRINTER_IP! Example: PRINTER_IP=192.168.1.145}"
+# ========================================
+#  Printer Proxy Installer / Updater / Remover
+# ========================================
+
+ACTION="${1:-install}"  # install | update | remove
+PRINTER_IP="${PRINTER_IP:-}"
 PORT="${PORT:-8080}"
 AUTH_USER="${AUTH_USER:-}"
 AUTH_PASS="${AUTH_PASS:-}"
-TAILSCALE_KEY="${TAILSCALE_KEY:-}"
+NGINX_SITE="/etc/nginx/sites-available/printer"
+NGINX_LINK="/etc/nginx/sites-enabled/printer"
 
-echo "🚀 Setting up printer proxy - targeting $PRINTER_IP on port $PORT"
+print_header() {
+  echo -e "\n───────────────────────────────────────────────"
+  echo -e " 🔧 Printer Proxy - $ACTION mode"
+  echo -e "───────────────────────────────────────────────\n"
+}
 
-### === 1. Install dependencies === ###
-apt update -y >/dev/null
-apt install -y curl nginx apache2-utils >/dev/null
+install_or_upgrade() {
+  if [ -z "$PRINTER_IP" ]; then
+    echo "❌ Error: Set PRINTER_IP first! Example:"
+    echo "   PRINTER_IP=192.168.1.145 bash install.sh"
+    exit 1
+  fi
 
-### === 2. Install and start Tailscale === ###
-if ! command -v tailscale >/dev/null 2>&1; then
-  echo "📡 Installing Tailscale..."
-  curl -fsSL https://tailscale.com/install.sh | bash
-fi
+  echo "📦 Installing dependencies..."
+  apt update -y >/dev/null
+  apt install -y nginx apache2-utils >/dev/null
 
-systemctl enable --now tailscaled
+  echo "⚙️  Generating nginx config → $NGINX_SITE"
 
-if [ -n "$TAILSCALE_KEY" ]; then
-  echo "🔐 Authenticating to Tailscale with key..."
-  tailscale up --authkey "$TAILSCALE_KEY" --accept-dns=true || true
-else
-  echo "⚠️ No TAILSCALE_KEY provided - you'll need to run 'tailscale up' manually to authenticate."
-fi
-
-### === 3. Configure nginx === ###
-echo "⚙️ Writing nginx config to /etc/nginx/sites-available/printer"
-cat >/etc/nginx/sites-available/printer <<EOF
+  cat >"$NGINX_SITE" <<EOF
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     '' close;
@@ -44,16 +45,16 @@ server {
     client_max_body_size 1G;
 EOF
 
-# Optional Basic Auth
-if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
-  htpasswd -bc /etc/nginx/.htpasswd "$AUTH_USER" "$AUTH_PASS"
-  cat >>/etc/nginx/sites-available/printer <<EOF
-    auth_basic "Restricted Area";
+  # Optional basic auth
+  if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
+    htpasswd -bc /etc/nginx/.htpasswd "$AUTH_USER" "$AUTH_PASS"
+    cat >>"$NGINX_SITE" <<EOF
+    auth_basic "Restricted Access";
     auth_basic_user_file /etc/nginx/.htpasswd;
 EOF
-fi
+  fi
 
-cat >>/etc/nginx/sites-available/printer <<EOF
+  cat >>"$NGINX_SITE" <<EOF
 
     location / {
         proxy_pass http://$PRINTER_IP;
@@ -62,7 +63,6 @@ cat >>/etc/nginx/sites-available/printer <<EOF
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
-
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
@@ -74,23 +74,46 @@ cat >>/etc/nginx/sites-available/printer <<EOF
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/printer /etc/nginx/sites-enabled/printer
+  ln -sf "$NGINX_SITE" "$NGINX_LINK"
 
-echo "✅ Testing nginx configuration..."
-nginx -t
-systemctl reload nginx
-systemctl enable nginx
+  echo "🔍 Testing nginx configuration..."
+  nginx -t
+  systemctl reload nginx
+  systemctl enable nginx >/dev/null
 
-### === 4. Summary === ###
-IP_ADDR=$(hostname -I | awk '{print $1}')
-TAILNET_ADDR=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+  local VPS_IP
+  VPS_IP=$(hostname -I | awk '{print $1}')
 
-echo
-echo "🎉 Setup complete!"
-echo "───────────────────────────────────────────────"
-echo " 🖥️  Local Access:  http://$IP_ADDR:$PORT"
-[ -n "$TAILNET_ADDR" ] && echo " 🌐 Tailscale:     http://$TAILNET_ADDR:$PORT"
-echo " 🧩 Proxy Target:  http://$PRINTER_IP"
-[ -n "$AUTH_USER" ] && echo " 🔑 Basic Auth:   $AUTH_USER / $AUTH_PASS"
-echo "───────────────────────────────────────────────"
-echo "Done ✅"
+  echo
+  echo "🎉 Printer proxy ready!"
+  echo "───────────────────────────────────────────────"
+  echo " 🌐 Access URL:  http://$VPS_IP:$PORT"
+  echo " 🧩 Proxy target: http://$PRINTER_IP"
+  [ -n "$AUTH_USER" ] && echo " 🔑 Auth: $AUTH_USER / $AUTH_PASS"
+  echo "───────────────────────────────────────────────"
+}
+
+remove_proxy() {
+  echo "🧹 Removing printer proxy configuration..."
+  rm -f "$NGINX_SITE" "$NGINX_LINK" /etc/nginx/.htpasswd 2>/dev/null || true
+  systemctl reload nginx
+  echo "✅ Printer proxy removed."
+}
+
+# =========================
+#  MAIN
+# =========================
+print_header
+
+case "$ACTION" in
+  install|update|upgrade)
+    install_or_upgrade
+    ;;
+  remove|uninstall)
+    remove_proxy
+    ;;
+  *)
+    echo "Usage: $0 [install|update|remove]"
+    exit 1
+    ;;
+esac
